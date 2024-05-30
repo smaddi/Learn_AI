@@ -1,0 +1,10 @@
+jupyterlab
+pandas
+numpy
+matplotlib
+torch
+
+# For Micrograd Videos
+graphviz
+micrograd
+scikit-learn
