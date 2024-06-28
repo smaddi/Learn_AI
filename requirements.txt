@@ -9,3 +9,6 @@ plotly
 graphviz
 micrograd
 scikit-learn
+ipywidgets
+torchviz
+graphviz
