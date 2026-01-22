@@ -35,6 +35,8 @@ def get_default_parameters():
         # Growth & Taxes
         'holding_years': 5,             # J3: Years to own
         'appreciation_yoy': 0.03,       # J16: 3%
+        'rent_appreciation_yoy': 0.03,  # YoY Rent growth
+        'expense_appreciation_yoy': 0.02, # YoY Expense growth
         'realtor_commission_factor': 0.94, # J18: 100% - 6% commission = 94% net
         'tax_bracket': 0.24,            # J25: 24% (Federal Ordinary Income)
         
@@ -48,8 +50,13 @@ def get_default_parameters():
         'recapture_tax_rate': 0.25,       # Depreciation recapture tax rate (Federal)
         
         # S&P 500 Comparison Details
-        'sp500_annual_return': 0.10       # 10% average annual return
+        'sp500_annual_return': 0.10,      # 10% average annual return
+        
+        # Cashflow Strategy
+        'positive_cashflow_strategy': 'reinvest' # Options: 'reinvest', 'pay_down_loan'
     }
+
+# Mortgage types are now defined directly within each deal using 'loan_scenarios'.
 
 def calculate_deal(params):
     """
@@ -57,9 +64,9 @@ def calculate_deal(params):
     Returns a dictionary containing all input parameters and calculated results.
     """
     
-    # 1. UNPACK VARIABLES
-    # We copy params to a local variable 'p' for shorter referencing
-    p = params
+    # Merge input params with defaults to ensure all keys exist
+    p = get_default_parameters()
+    p.update(params)
     
     # Extract values for cleaner math code below
     sqft = p['sqft']
@@ -143,7 +150,17 @@ def calculate_deal(params):
     # Mortgage Payment (EMI)
     monthly_rate = effective_interest_rate / 12
     total_months = loan_duration_years * 12
-    emi = loan_amount * monthly_rate * (math.pow(1 + monthly_rate, total_months)) / (math.pow(1 + monthly_rate, total_months) - 1)
+    
+    mortgage_type = p.get('mortgage_type', 'amortizing')
+    
+    if mortgage_type == 'interest_only':
+        emi = loan_amount * monthly_rate
+    else:
+        # Standard Amortization
+        if monthly_rate > 0:
+            emi = loan_amount * monthly_rate * (math.pow(1 + monthly_rate, total_months)) / (math.pow(1 + monthly_rate, total_months) - 1)
+        else:
+            emi = loan_amount / total_months
 
     # Monthly Expenses
     prop_tax_monthly = (quote_price * prop_tax_rate) / 12
@@ -166,45 +183,96 @@ def calculate_deal(params):
         closing_credits
     )
 
-    # Cash Flow
-    monthly_out_of_pocket = total_monthly_payment - monthly_rent 
-
-    # Amortization & S&P Simulation
+    # Appreciation Rates (defaults if not provided)
+    rent_appreciation_yoy = p.get('rent_appreciation_yoy', 0.03)
+    expense_appreciation_yoy = p.get('expense_appreciation_yoy', 0.02)
+    
+    # Precise Monthly Rate for S&P (Effective Annual Rate to Monthly)
+    # R_monthly = (1 + R_annual)^(1/12) - 1
+    sp500_monthly_rate = math.pow(1 + sp500_annual_return, 1/12) - 1
+    
+    # ==========================================
+    # 3. SIMULATION LOOP (Monthly)
+    # ==========================================
     remaining_balance = loan_amount
     total_interest_paid = 0
     total_prop_tax_paid = 0
+    total_rent_income = 0
+    total_operating_expenses = 0
     
+    # House Side Investment Account (Reinvesting monthly profits)
+    house_reinvestment_balance = 0
+    
+    # S&P Side (Starting from same initial capital)
     sp500_balance = total_starting_investment
     sp500_total_invested = total_starting_investment
-    sp500_monthly_rate = sp500_annual_return / 12
     
     months_owned = int(holding_years * 12)
     
-    for i in range(1, months_owned + 1):
+    for month in range(1, months_owned + 1):
+        # Determine Current Year for appreciation
+        year = math.ceil(month / 12) - 1
+        
+        # Grow components
+        current_rent = monthly_rent * math.pow(1 + rent_appreciation_yoy, year)
+        current_tax = prop_tax_monthly * math.pow(1 + expense_appreciation_yoy, year)
+        current_ins = home_ins_monthly * math.pow(1 + expense_appreciation_yoy, year)
+        current_hoa = hoa_monthly * math.pow(1 + expense_appreciation_yoy, year)
+        current_mgmt = current_rent * prop_management_percent
+        
+        # Loan Math
         interest_payment = remaining_balance * monthly_rate
-        principal_payment = emi - interest_payment
+        
+        # If interest_only, emi logic is handled
+        if mortgage_type == 'interest_only':
+            actual_emi = interest_payment
+            principal_payment = 0
+        else:
+            actual_emi = emi
+            principal_payment = actual_emi - interest_payment
+            
         remaining_balance -= principal_payment
         
+        # Accumulate Totals
         total_interest_paid += interest_payment
-        total_prop_tax_paid += prop_tax_monthly
+        total_prop_tax_paid += current_tax
+        total_rent_income += current_rent
         
-        # S&P 500 Logic (Compounding)
+        monthly_op_ex = current_tax + current_ins + current_hoa + pmi_monthly + current_mgmt
+        total_operating_expenses += monthly_op_ex
+        
+        # House Cash Flow & Reinvestment
+        monthly_out_of_pocket_current = (actual_emi + monthly_op_ex) - current_rent
+        if month == 1:
+            monthly_out_of_pocket = monthly_out_of_pocket_current
+        
+        # S&P Logic: If you didn't buy the house, you invest the 'out of pocket' cost every month
         sp500_balance *= (1 + sp500_monthly_rate)
-        
-        # If the house costs money monthly, invest that equivalent amount in S&P instead for fair comparison
-        if monthly_out_of_pocket > 0:
-            sp500_balance += monthly_out_of_pocket
-            sp500_total_invested += monthly_out_of_pocket
+        if monthly_out_of_pocket_current > 0:
+            sp500_balance += monthly_out_of_pocket_current
+            sp500_total_invested += monthly_out_of_pocket_current
+            
+        # House Logic: Handle positive cashflow
+        house_reinvestment_balance *= (1 + sp500_monthly_rate)
+        if monthly_out_of_pocket_current < 0:
+            extra_cash = abs(monthly_out_of_pocket_current)
+            if p.get('positive_cashflow_strategy', 'reinvest') == 'pay_down_loan':
+                remaining_balance = max(0, remaining_balance - extra_cash)
+            else:
+                house_reinvestment_balance += extra_cash
 
-    total_rent_profit = -monthly_out_of_pocket * months_owned 
-
-    # Sale & Exit Calculations
+    # ==========================================
+    # 4. EXIT CALCULATIONS
+    # ==========================================
+    
+    # Future Value based on Appreciation
+    future_value = fair_market_value * math.pow(1 + appreciation_yoy, holding_years)
+    sale_net_price = future_value * realtor_commission_factor
+    
+    # Depreciation
     building_value = quote_price * building_value_ratio
     annual_depreciation = building_value / depreciation_years
     total_depreciation = annual_depreciation * holding_years
-    # Future Value based on Fair Market Value, not just Purchase Price
-    future_value = fair_market_value * math.pow(1 + appreciation_yoy, holding_years)
-    sale_net_price = future_value * realtor_commission_factor
     
     # Capital Gains Tax
     initial_cost_basis = quote_price + one_time_other
@@ -227,28 +295,31 @@ def calculate_deal(params):
             capital_gains_tax = tax_on_recapture + tax_on_capital_gain
 
     # Rental Income Tax
-    total_rent_income = monthly_rent * months_owned
-    total_non_principal_expenses = (
-        total_interest_paid + 
-        total_prop_tax_paid + 
-        (hoa_monthly + home_ins_monthly + pmi_monthly + prop_management_fee) * months_owned
-    )
+    total_non_principal_expenses = total_interest_paid + total_operating_expenses
     total_taxable_rental_income = total_rent_income - total_non_principal_expenses - total_depreciation
     rental_tax_impact = total_taxable_rental_income * combined_ordinary_rate
     
-    cash_from_sale = sale_net_price - remaining_balance - capital_gains_tax
+    # Final Cash At Exit (House side)
+    # Includes: Sale Proceeds - Loan + Reinvested Profits + Safety Reserve - Taxes
+    cash_from_sale = (sale_net_price - remaining_balance) - capital_gains_tax + safety_reserve
     
-    # Returns Analysis
-    total_net_profit = cash_from_sale + total_rent_profit - rental_tax_impact - total_starting_investment
-    ending_value = total_starting_investment + total_net_profit
+    # ==========================================
+    # 5. RETURNS ANALYSIS
+    # ==========================================
+    # Total investment = Starting + contributions over time
+    total_invested_denominator = sp500_total_invested 
+    
+    # End Value of House side = cash_from_sale + house_reinvestment_balance - rental_tax_impact
+    ending_value = cash_from_sale + house_reinvestment_balance - rental_tax_impact
+    total_net_profit = ending_value - total_invested_denominator
     
     annualized_return = 0.0
-    if total_starting_investment > 0 and ending_value > 0:
-        annualized_return = (math.pow(ending_value / total_starting_investment, 1 / holding_years) - 1) * 100
+    if total_invested_denominator > 0 and ending_value > 0:
+        annualized_return = (math.pow(ending_value / total_invested_denominator, 1 / holding_years) - 1) * 100
         
     roi = 0.0
-    if total_starting_investment > 0:
-        roi = (total_net_profit / total_starting_investment) * 100
+    if total_invested_denominator > 0:
+        roi = (total_net_profit / total_invested_denominator) * 100
     
     # S&P Final
     sp500_gross_gain = sp500_balance - sp500_total_invested
@@ -269,7 +340,7 @@ def calculate_deal(params):
 
     net_monthly_pocket = total_net_profit / months_owned
     
-    # Return everything in local scope as a dictionary (this is the magic that avoids classes)
+    # Return everything in local scope
     return locals()
 
 def print_detailed_report(results):
@@ -296,6 +367,7 @@ def print_detailed_report(results):
     print(f"{'Interest Rate':<25} {r['effective_interest_rate']*100:.3f}%")
     print(f"{'Points':<25} {r['points_purchased']} points (${r['points_cost']:,.2f})")
     print(f"{'Loan Duration':<25} {r['loan_duration_years']} Years ({r['total_months']} months)")
+    print(f"{'Cashflow Strategy':<25} {r['p'].get('positive_cashflow_strategy', 'reinvest')}")
     print("-" * 70)
     
     print(f"{'--- MONTHLY BREAKDOWN ---':^70}")
@@ -344,7 +416,7 @@ def print_detailed_report(results):
     else:
         print(f"{'Tax Due (Rental Income)':<25} ${r['rental_tax_impact']:,.2f}")
         
-    print(f"{'Operational Cash Flow':<25} ${r['total_rent_profit']:,.2f}")
+    print(f"{'Reinvested Cash Flow':<25} ${r['house_reinvestment_balance']:,.2f}")
     print(f"{'Total Net Profit':<25} ${r['total_net_profit']:,.2f}")
     print(f"{'Total ROI':<25} {r['roi']:.2f}%")
     print(f"{'Annualized Return (CAGR)':<25} {r['annualized_return']:.2f}%")
@@ -393,6 +465,8 @@ def print_comparison_table(all_results):
         ('Loan Amount', 'loan_amount', '${:,.0f}'),
         ('Interest Rate', 'effective_interest_rate', '{:.3%}'),
         ('Loan Duration', 'total_months', '{:.0f} months'),
+        ('Mortgage Type', 'mortgage_type', '{}'),
+        ('Cashflow Strategy', 'positive_cashflow_strategy', '{}'),
         
         # Monthly Breakdown
         ('--- MONTHLY BREAKDOWN ---', None, None),
@@ -432,7 +506,7 @@ def print_comparison_table(all_results):
         # Returns Analysis
         ('--- RETURNS ANALYSIS ---', None, None),
         ('Rental Tax Impact', 'rental_tax_impact', '${:,.2f}'),
-        ('Total Rent Profit', 'total_rent_profit', '${:,.2f}'),
+        ('Reinvested Cash Flow', 'house_reinvestment_balance', '${:,.2f}'),
         ('Total Net Profit', 'total_net_profit', '${:,.2f}'),
         ('Total ROI', 'roi', '{:.2f}%'),
         ('Annualized Return (CAGR)', 'annualized_return', '{:.2f}%'),
@@ -525,7 +599,7 @@ if __name__ == "__main__":
     # DEAL 1: Irenturent PA
     # -------------------------------------------------------------------------
     deal1 = {
-        'deal_name': 'Irent_urent',
+        'deal_name': 'Irent',
         
         # Property Details
         'sqft': 2300,
@@ -533,34 +607,18 @@ if __name__ == "__main__":
         'fair_market_value': 500000.00, # Instant Equity!
         'rent_per_sqft': 1.31,
         
-        # Loan & Investment Details
-        'down_percent': 0.20,           # 20%
-        'advance_payment': 5000.00,     # Pre-paid/Advance
-        'one_time_other': 20000.00,     # Closing costs/Repairs
-        'closing_credits': 0.00,        # Credit received at closing
-        
-        # Mortgage Buy Down
-        'loan_duration_years': 30,      # Standard 30 years
-        'base_interest_rate': 0.04,     # Current Market Rate
-        'points_purchased': 0,          # Number of points to buy
-        'cost_per_point_percent': 1.0,  # Cost per point as % of loan amount
-        'rate_reduction_per_point': 0.0025, # 0.25% reduction per point
-        
         # Expenses & Reserves
         'prop_tax_rate': 0.0151,        # 1.51%
         'hoa_monthly': 119.00,
         'home_ins_monthly': 60.00,
-        'pmi_monthly': 0.00,
         'prop_management_percent': 0.0, # 0% if self-managed
         'safety_deposit_months': 2,     # Reserve fund in months of total costs
         
         # Growth & Taxes
-        'holding_years': 5,             # Years to own
+        'holding_years': 3,             # Global default holding period
         'appreciation_yoy': 0.03,       # 3%
         'realtor_commission_factor': 0.94, # 94% net after 6% comm
         'tax_bracket': 0.24,            # Federal Ordinary Income
-        
-        # State Selection (Options: 'CA', 'TX', 'FL', 'NY', 'WA', 'IL', 'MA', 'PA')
         'state': 'PA',
         
         # Investment Tax Details (Advanced)
@@ -570,7 +628,74 @@ if __name__ == "__main__":
         'recapture_tax_rate': 0.25,
         
         # S&P 500 Comparison
-        'sp500_annual_return': 0.10
+        'sp500_annual_return': 0.10,
+        
+        # Self-Contained Loan Scenarios (Financing Details)
+        'loan_scenarios': [
+            {
+                'name': 'Rama', 
+                'mortgage_type': 'amortizing', 
+                'down_percent': 0.20,
+                'base_interest_rate': 0.04,
+                'loan_duration_years': 30,
+                'advance_payment': 5000.00,
+                'one_time_other': 20000.00,
+                'closing_credits': 0.00,
+                'points_purchased': 0,
+                'pmi_monthly': 0.00
+            },
+            {
+                'name': 'SBLOC_paydown', 
+                'mortgage_type': 'interest_only', 
+                'down_percent': 0.0, 
+                'base_interest_rate': 0.045,
+                'advance_payment': 5000.00,
+                'one_time_other': 20000.00,
+                'closing_credits': 0.00,
+                'positive_cashflow_strategy': 'pay_down_loan'
+            },
+            {
+                'name': 'SBLOC_paydown_20%', 
+                'mortgage_type': 'interest_only', 
+                'down_percent': 0.20, 
+                'base_interest_rate': 0.045,
+                'advance_payment': 5000.00,
+                'one_time_other': 20000.00,
+                'closing_credits': 0.00,
+                'positive_cashflow_strategy': 'pay_down_loan'
+            },
+            {
+                'name': 'SBLOC 5Y', 
+                'mortgage_type': 'interest_only', 
+                'down_percent': 0.0, 
+                'base_interest_rate': 0.045,
+                'advance_payment': 5000.00,
+                'one_time_other': 20000.00,
+                'closing_credits': 0.00
+            },
+            {
+                'name': 'SBLOC 5Y_20%', 
+                'mortgage_type': 'interest_only', 
+                'down_percent': 0.20, 
+                'base_interest_rate': 0.045,
+                'advance_payment': 5000.00,
+                'one_time_other': 20000.00,
+                'closing_credits': 0.00
+            },
+            {
+                'name': 'Morg', 
+                'mortgage_type': 'amortizing', 
+                'down_percent': 0.0,
+                'base_interest_rate': 0.058,
+                'loan_duration_years': 30,
+                'advance_payment': 5000.00,
+                'one_time_other': 20000.00,
+                'closing_credits': 0.00,
+                'points_purchased': 0,
+                'pmi_monthly': 0.00
+            },
+                       
+        ]
     }
 
     # -------------------------------------------------------------------------
@@ -582,27 +707,13 @@ if __name__ == "__main__":
         # Property Details
         'sqft': 2035,
         'quote_price': 370000.00,
-        'fair_market_value': 410000.00,
+        'fair_market_value': 390000.00,
         'rent_per_sqft': 1.0,
-        
-        # Loan & Investment Details
-        'down_percent': 0.25,
-        'advance_payment': 5000.00,
-        'one_time_other': 7000.00,
-        'closing_credits': 0.00,
-        
-        # Mortgage Buy Down
-        'loan_duration_years': 30,
-        'base_interest_rate': 0.065,
-        'points_purchased': 0,
-        'cost_per_point_percent': 1.0,
-        'rate_reduction_per_point': 0.0025,
         
         # Expenses & Reserves
         'prop_tax_rate': 0.009,
         'hoa_monthly': 29.167,           # Lower HOA
         'home_ins_monthly': 125.00,
-        'pmi_monthly': 0.00,
         'prop_management_percent': 0.007,
         'safety_deposit_months': 2,
         
@@ -611,8 +722,6 @@ if __name__ == "__main__":
         'appreciation_yoy': 0.03,
         'realtor_commission_factor': 0.94,
         'tax_bracket': 0.24,
-        
-        # State Selection
         'state': 'AR',
         
         # Investment Tax Details
@@ -622,11 +731,79 @@ if __name__ == "__main__":
         'recapture_tax_rate': 0.25,
         
         # S&P 500 Comparison
-        'sp500_annual_return': 0.10
+        'sp500_annual_return': 0.10,
+        
+        'loan_scenarios': [
+            {
+                'name': 'SBLOC 5Y', 
+                'mortgage_type': 'interest_only', 
+                'down_percent': 0.0, 
+                'base_interest_rate': 0.045,
+                'advance_payment': 5000.00,
+                'one_time_other': 20000.00,
+                'closing_credits': 0.00
+            },
+            {
+                'name': 'SBLOC 5Y_20%', 
+                'mortgage_type': 'interest_only', 
+                'down_percent': 0.20, 
+                'base_interest_rate': 0.045,
+                'advance_payment': 5000.00,
+                'one_time_other': 20000.00,
+                'closing_credits': 0.00
+            },
+            {
+                'name': 'Morg_30Y_1', 
+                'mortgage_type': 'amortizing', 
+                'down_percent': 0.0,
+                'base_interest_rate': 0.058,
+                'loan_duration_years': 30,
+                'advance_payment': 5000.00,
+                'one_time_other': 20000.00,
+                'closing_credits': 0.00,
+                'points_purchased': 0,
+                'pmi_monthly': 0.00
+            }
+        ]
     }
 
-    # List of all deals to compare
-    my_deals = [deal1, deal2]
+    
+    def create_variants(base_deal):
+        """
+        Generates multiple deal configurations based on the 'loan_scenarios' 
+        list provided inside the deal dictionary.
+        """
+        scenarios = base_deal.get('loan_scenarios')
+        
+        # If no scenarios, just return the deal as-is (one variant)
+        if not scenarios:
+            return [base_deal]
+            
+        variants = []
+        for s in scenarios:
+            variant = base_deal.copy()
+            # Remove the scenarios list from the variant to keep it clean
+            if 'loan_scenarios' in variant: 
+                del variant['loan_scenarios']
+            
+            # Update the variant with scenario-specific settings
+            variant.update(s)
+            
+            # Set the final deal name
+            opt_name = s.get('name', 'Custom Loan')
+            variant['deal_name'] = f"{base_deal['deal_name']} ({opt_name})"
+            
+            variants.append(variant)
+            
+        return variants
+
+    # List of all properties to process
+    properties = [deal1]
+    
+    # Generate all mortgage options for each property
+    my_deals = []
+    for prop in properties:
+        my_deals.extend(create_variants(prop))
     
     # =========================================================================
     # EXECUTION
