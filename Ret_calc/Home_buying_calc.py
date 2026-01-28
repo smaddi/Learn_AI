@@ -1,5 +1,77 @@
 import math
 
+def calculate_xirr(cashflows, dates_in_months, guess=0.1, max_iterations=100, tolerance=1e-6):
+    """
+    Calculate XIRR (Extended Internal Rate of Return) for irregular cashflows.
+    
+    Args:
+        cashflows: List of cash flows (negative = outflow, positive = inflow)
+        dates_in_months: List of months when each cashflow occurs (0 = start)
+        guess: Initial guess for annual rate
+        max_iterations: Maximum iterations for Newton-Raphson
+        tolerance: Convergence tolerance
+    
+    Returns:
+        Annual IRR as a decimal (e.g., 0.10 for 10%)
+    """
+    if not cashflows or len(cashflows) != len(dates_in_months):
+        return 0.0
+    
+    # Convert months to years for annual rate calculation
+    dates_in_years = [m / 12.0 for m in dates_in_months]
+    
+    def npv(rate):
+        """Calculate NPV at given annual rate."""
+        total = 0.0
+        for cf, t in zip(cashflows, dates_in_years):
+            if rate <= -1 and t != 0:
+                return float('inf')
+            total += cf / pow(1 + rate, t)
+        return total
+    
+    def npv_derivative(rate):
+        """Calculate derivative of NPV for Newton-Raphson."""
+        total = 0.0
+        for cf, t in zip(cashflows, dates_in_years):
+            if t == 0:
+                continue
+            if rate <= -1:
+                return float('inf')
+            total -= t * cf / pow(1 + rate, t + 1)
+        return total
+    
+    # Newton-Raphson method
+    rate = guess
+    for _ in range(max_iterations):
+        npv_val = npv(rate)
+        npv_deriv = npv_derivative(rate)
+        
+        if abs(npv_deriv) < 1e-10:
+            break
+            
+        new_rate = rate - npv_val / npv_deriv
+        
+        # Bound the rate to reasonable values
+        new_rate = max(-0.99, min(new_rate, 10.0))
+        
+        if abs(new_rate - rate) < tolerance:
+            return new_rate
+        rate = new_rate
+    
+    # Fallback: bisection method if Newton-Raphson fails
+    low, high = -0.99, 5.0
+    for _ in range(100):
+        mid = (low + high) / 2
+        if npv(mid) > 0:
+            low = mid
+        else:
+            high = mid
+        if abs(high - low) < tolerance:
+            return mid
+    
+    return rate
+
+
 def get_default_parameters():
     """Returns the default configuration for a home deal."""
     return {
@@ -24,6 +96,9 @@ def get_default_parameters():
         'cost_per_point_percent': 1.0,  # Cost per point as % of loan amount
         'rate_reduction_per_point': 0.0025, # 0.25% reduction per point
         
+        # Interest-Only Loan Configuration
+        'interest_only_period_years': 3,  # Years of interest-only before amortizing
+        
         # Expenses & Reserves
         'prop_tax_rate': 0.0151,        # J9: 1.51%
         'hoa_monthly': 119.00,          # J11
@@ -37,6 +112,7 @@ def get_default_parameters():
         'appreciation_yoy': 0.03,       # J16: 3%
         'rent_appreciation_yoy': 0.03,  # YoY Rent growth
         'expense_appreciation_yoy': 0.02, # YoY Expense growth
+        'prop_tax_follows_appreciation': False,  # If True, prop tax grows with home value
         'realtor_commission_factor': 0.94, # J18: 100% - 6% commission = 94% net
         'tax_bracket': 0.24,            # J25: 24% (Federal Ordinary Income)
         
@@ -48,6 +124,7 @@ def get_default_parameters():
         'depreciation_years': 27.5,       # Residential rental property standard
         'building_value_ratio': 0.80,     # 80% building value (depreciable)
         'recapture_tax_rate': 0.25,       # Depreciation recapture tax rate (Federal)
+        'passive_loss_limit': 25000.00,   # Annual passive loss limit against ordinary income
         
         # S&P 500 Comparison Details
         'sp500_annual_return': 0.10,      # 10% average annual return
@@ -83,6 +160,7 @@ def calculate_deal(params):
     points_purchased = p['points_purchased']
     cost_per_point_percent = p['cost_per_point_percent']
     rate_reduction_per_point = p['rate_reduction_per_point']
+    interest_only_period_years = p.get('interest_only_period_years', 3)
     
     prop_tax_rate = p['prop_tax_rate']
     hoa_monthly = p['hoa_monthly']
@@ -152,15 +230,19 @@ def calculate_deal(params):
     total_months = loan_duration_years * 12
     
     mortgage_type = p.get('mortgage_type', 'amortizing')
+    interest_only_period_months = int(interest_only_period_years * 12)
     
-    if mortgage_type == 'interest_only':
-        emi = loan_amount * monthly_rate
+    # Calculate amortizing EMI (used after interest-only period or for fully amortizing loans)
+    if monthly_rate > 0:
+        emi_amortizing = loan_amount * monthly_rate * (math.pow(1 + monthly_rate, total_months)) / (math.pow(1 + monthly_rate, total_months) - 1)
     else:
-        # Standard Amortization
-        if monthly_rate > 0:
-            emi = loan_amount * monthly_rate * (math.pow(1 + monthly_rate, total_months)) / (math.pow(1 + monthly_rate, total_months) - 1)
-        else:
-            emi = loan_amount / total_months
+        emi_amortizing = loan_amount / total_months
+    
+    # For interest-only, initial EMI is just interest; will switch to amortizing after period
+    if mortgage_type == 'interest_only':
+        emi = loan_amount * monthly_rate  # Initial interest-only payment
+    else:
+        emi = emi_amortizing
 
     # Monthly Expenses
     prop_tax_monthly = (quote_price * prop_tax_rate) / 12
@@ -186,6 +268,8 @@ def calculate_deal(params):
     # Appreciation Rates (defaults if not provided)
     rent_appreciation_yoy = p.get('rent_appreciation_yoy', 0.03)
     expense_appreciation_yoy = p.get('expense_appreciation_yoy', 0.02)
+    prop_tax_follows_appreciation = p.get('prop_tax_follows_appreciation', False)
+    passive_loss_limit = p.get('passive_loss_limit', 25000.00)
     
     # Precise Monthly Rate for S&P (Effective Annual Rate to Monthly)
     # R_monthly = (1 + R_annual)^(1/12) - 1
@@ -209,29 +293,58 @@ def calculate_deal(params):
     
     months_owned = int(holding_years * 12)
     
+    # Track monthly out-of-pocket for reporting (first, last, average)
+    monthly_out_of_pocket_first = 0
+    monthly_out_of_pocket_last = 0
+    total_out_of_pocket_sum = 0
+    
+    # Track cashflows for XIRR calculation
+    house_cashflows = [-total_starting_investment]  # Initial investment (outflow)
+    house_cashflow_months = [0]  # Month 0
+    sp500_cashflows = [-total_starting_investment]  # Initial investment (outflow)
+    sp500_cashflow_months = [0]  # Month 0
+    
     for month in range(1, months_owned + 1):
         # Determine Current Year for appreciation
         year = math.ceil(month / 12) - 1
         
         # Grow components
         current_rent = monthly_rent * math.pow(1 + rent_appreciation_yoy, year)
-        current_tax = prop_tax_monthly * math.pow(1 + expense_appreciation_yoy, year)
+        
+        # Property tax: optionally follow home appreciation instead of expense inflation
+        if prop_tax_follows_appreciation:
+            current_home_value = quote_price * math.pow(1 + appreciation_yoy, year)
+            current_tax = (current_home_value * prop_tax_rate) / 12
+        else:
+            current_tax = prop_tax_monthly * math.pow(1 + expense_appreciation_yoy, year)
+        
         current_ins = home_ins_monthly * math.pow(1 + expense_appreciation_yoy, year)
         current_hoa = hoa_monthly * math.pow(1 + expense_appreciation_yoy, year)
         current_mgmt = current_rent * prop_management_percent
         
-        # Loan Math
+        # Loan Math - handle interest-only period transition
         interest_payment = remaining_balance * monthly_rate
         
-        # If interest_only, emi logic is handled
         if mortgage_type == 'interest_only':
-            actual_emi = interest_payment
-            principal_payment = 0
+            if month <= interest_only_period_months:
+                # During interest-only period
+                actual_emi = interest_payment
+                principal_payment = 0
+            else:
+                # After interest-only period, switch to amortizing
+                # Recalculate EMI based on remaining balance and remaining term
+                remaining_months = total_months - month + 1
+                if monthly_rate > 0 and remaining_months > 0:
+                    actual_emi = remaining_balance * monthly_rate * (math.pow(1 + monthly_rate, remaining_months)) / (math.pow(1 + monthly_rate, remaining_months) - 1)
+                else:
+                    actual_emi = remaining_balance / max(1, remaining_months)
+                principal_payment = actual_emi - interest_payment
         else:
             actual_emi = emi
             principal_payment = actual_emi - interest_payment
             
         remaining_balance -= principal_payment
+        remaining_balance = max(0, remaining_balance)  # Prevent negative balance
         
         # Accumulate Totals
         total_interest_paid += interest_payment
@@ -242,15 +355,24 @@ def calculate_deal(params):
         total_operating_expenses += monthly_op_ex
         
         # House Cash Flow & Reinvestment
+        # Positive = paying out of pocket (expenses > rent)
+        # Negative = receiving cash (rent > expenses)
         monthly_out_of_pocket_current = (actual_emi + monthly_op_ex) - current_rent
+        
+        # Track for reporting
         if month == 1:
-            monthly_out_of_pocket = monthly_out_of_pocket_current
+            monthly_out_of_pocket_first = monthly_out_of_pocket_current
+        monthly_out_of_pocket_last = monthly_out_of_pocket_current
+        total_out_of_pocket_sum += monthly_out_of_pocket_current
         
         # S&P Logic: If you didn't buy the house, you invest the 'out of pocket' cost every month
         sp500_balance *= (1 + sp500_monthly_rate)
         if monthly_out_of_pocket_current > 0:
             sp500_balance += monthly_out_of_pocket_current
             sp500_total_invested += monthly_out_of_pocket_current
+            # Track for XIRR
+            sp500_cashflows.append(-monthly_out_of_pocket_current)  # Outflow
+            sp500_cashflow_months.append(month)
             
         # House Logic: Handle positive cashflow
         house_reinvestment_balance *= (1 + sp500_monthly_rate)
@@ -260,6 +382,15 @@ def calculate_deal(params):
                 remaining_balance = max(0, remaining_balance - extra_cash)
             else:
                 house_reinvestment_balance += extra_cash
+        elif monthly_out_of_pocket_current > 0:
+            # Track house contributions for XIRR (when paying out of pocket)
+            house_cashflows.append(-monthly_out_of_pocket_current)  # Outflow
+            house_cashflow_months.append(month)
+    
+    # Calculate average monthly out-of-pocket
+    monthly_out_of_pocket_avg = total_out_of_pocket_sum / months_owned if months_owned > 0 else 0
+    # Keep backward compatibility - use first month value as the main one
+    monthly_out_of_pocket = monthly_out_of_pocket_first
 
     # ==========================================
     # 4. EXIT CALCULATIONS
@@ -269,10 +400,10 @@ def calculate_deal(params):
     future_value = fair_market_value * math.pow(1 + appreciation_yoy, holding_years)
     sale_net_price = future_value * realtor_commission_factor
     
-    # Depreciation
+    # Depreciation - capped at building value
     building_value = quote_price * building_value_ratio
     annual_depreciation = building_value / depreciation_years
-    total_depreciation = annual_depreciation * holding_years
+    total_depreciation = min(annual_depreciation * holding_years, building_value)
     
     # Capital Gains Tax
     initial_cost_basis = quote_price + one_time_other
@@ -294,10 +425,24 @@ def calculate_deal(params):
             
             capital_gains_tax = tax_on_recapture + tax_on_capital_gain
 
-    # Rental Income Tax
+    # Rental Income Tax with Passive Loss Limitation
     total_non_principal_expenses = total_interest_paid + total_operating_expenses
     total_taxable_rental_income = total_rent_income - total_non_principal_expenses - total_depreciation
-    rental_tax_impact = total_taxable_rental_income * combined_ordinary_rate
+    
+    # Apply passive loss limitation (simplified annual calculation)
+    # If taxable_rental_income is negative (a loss), limit deduction to passive_loss_limit per year
+    if total_taxable_rental_income < 0:
+        max_allowed_loss = passive_loss_limit * holding_years
+        # The usable loss is the smaller of actual loss or allowed limit
+        usable_loss = max(total_taxable_rental_income, -max_allowed_loss)
+        suspended_passive_losses = total_taxable_rental_income - usable_loss  # Negative value
+        rental_tax_impact = usable_loss * combined_ordinary_rate  # Tax benefit (negative)
+    else:
+        suspended_passive_losses = 0
+        rental_tax_impact = total_taxable_rental_income * combined_ordinary_rate  # Tax owed (positive)
+    
+    # At sale, suspended passive losses are released and can offset gains
+    # (Simplified: we just track them for reporting, already included in rental_tax_impact calculation)
     
     # Final Cash At Exit (House side)
     # Includes: Sale Proceeds - Loan + Reinvested Profits + Safety Reserve - Taxes
@@ -313,9 +458,23 @@ def calculate_deal(params):
     ending_value = cash_from_sale + house_reinvestment_balance - rental_tax_impact
     total_net_profit = ending_value - total_invested_denominator
     
+    # Calculate proper XIRR for house investment
+    # Add final cashflow (ending value at sale)
+    house_cashflows.append(ending_value)
+    house_cashflow_months.append(months_owned)
+    
+    # Calculate annualized return using XIRR
     annualized_return = 0.0
-    if total_invested_denominator > 0 and ending_value > 0:
-        annualized_return = (math.pow(ending_value / total_invested_denominator, 1 / holding_years) - 1) * 100
+    if total_invested_denominator > 0:
+        if ending_value > 0:
+            xirr_rate = calculate_xirr(house_cashflows, house_cashflow_months)
+            annualized_return = xirr_rate * 100
+        else:
+            # Handle loss scenario - calculate negative return
+            # Use simple formula as approximation for losses
+            annualized_return = (math.pow(max(0.001, ending_value) / total_invested_denominator, 1 / holding_years) - 1) * 100
+            if ending_value <= 0:
+                annualized_return = -100.0  # Complete loss
         
     roi = 0.0
     if total_invested_denominator > 0:
@@ -334,11 +493,21 @@ def calculate_deal(params):
     sp500_roi = 0.0
     if sp500_total_invested > 0:
         sp500_roi = (sp500_net_profit / sp500_total_invested) * 100
-        
+    
+    # Calculate proper XIRR for S&P 500 investment
     sp500_ending_value = sp500_total_invested + sp500_net_profit
-    sp500_cagr = (math.pow(sp500_ending_value / sp500_total_invested, 1 / holding_years) - 1) * 100
+    sp500_cashflows.append(sp500_ending_value)
+    sp500_cashflow_months.append(months_owned)
+    
+    sp500_cagr = 0.0
+    if sp500_total_invested > 0:
+        if sp500_ending_value > 0:
+            sp500_xirr_rate = calculate_xirr(sp500_cashflows, sp500_cashflow_months)
+            sp500_cagr = sp500_xirr_rate * 100
+        else:
+            sp500_cagr = -100.0  # Complete loss
 
-    net_monthly_pocket = total_net_profit / months_owned
+    net_monthly_pocket = total_net_profit / months_owned if months_owned > 0 else 0
     
     # Return everything in local scope
     return locals()
@@ -360,12 +529,19 @@ def print_detailed_report(results):
     if r['fair_market_value'] != r['quote_price']:
         print(f"{'Fair Market Value':<25} ${r['fair_market_value']:,.2f} (!)")
     print(f"{'Sqft':<25} {r['sqft']}")
-    print(f"{'Price $/sqft':<25} ${r['quote_price']/r['sqft']:,.2f}")
+    price_per_sqft = r['quote_price'] / r['sqft'] if r['sqft'] > 0 else 0
+    print(f"{'Price $/sqft':<25} ${price_per_sqft:,.2f}")
     print(f"{'Down Payment %':<25} {r['down_percent']*100:.1f}%")
     print(f"{'Down Payment $':<25} ${r['total_down_amount']:,.2f}")
     print(f"{'Loan Amount':<25} ${r['loan_amount']:,.2f}")
     print(f"{'Interest Rate':<25} {r['effective_interest_rate']*100:.3f}%")
     print(f"{'Points':<25} {r['points_purchased']} points (${r['points_cost']:,.2f})")
+    mortgage_type = r.get('mortgage_type', 'amortizing')
+    if mortgage_type == 'interest_only':
+        io_period = r.get('interest_only_period_years', 3)
+        print(f"{'Loan Type':<25} Interest-Only ({io_period} yrs) then Amortizing")
+    else:
+        print(f"{'Loan Type':<25} Amortizing")
     print(f"{'Loan Duration':<25} {r['loan_duration_years']} Years ({r['total_months']} months)")
     print(f"{'Cashflow Strategy':<25} {r['p'].get('positive_cashflow_strategy', 'reinvest')}")
     print("-" * 70)
@@ -379,7 +555,13 @@ def print_detailed_report(results):
     print(f"  - HOA:{'':<15} ${r['hoa_monthly']:,.2f}")
     print(f"  - PMI:{'':<15} ${r['pmi_monthly']:,.2f}")
     print(f"  - Prop Mgmt ({r['prop_management_percent']*100:.0f}%):{'':<7} ${r['prop_management_fee']:,.2f}")
-    print(f"{'Monthly Out of Pocket':<25} ${r['monthly_out_of_pocket']:,.2f}")
+    # Monthly out of pocket: positive = paying, negative = receiving cashflow
+    oop_first = r.get('monthly_out_of_pocket_first', r['monthly_out_of_pocket'])
+    oop_last = r.get('monthly_out_of_pocket_last', r['monthly_out_of_pocket'])
+    oop_avg = r.get('monthly_out_of_pocket_avg', r['monthly_out_of_pocket'])
+    print(f"{'Out of Pocket (Month 1)':<25} ${oop_first:,.2f}")
+    print(f"{'Out of Pocket (Final Mo)':<25} ${oop_last:,.2f}")
+    print(f"{'Out of Pocket (Average)':<25} ${oop_avg:,.2f}")
     print("-" * 70)
 
     print(f"{'--- INVESTMENT CASH FLOW ---':^70}")
@@ -397,8 +579,10 @@ def print_detailed_report(results):
     print(f"{'Future Home Value':<25} ${r['future_value']:,.2f} ({r['appreciation_yoy']*100:.1f}% YoY)")
     print(f"{'Loan Balance':<25} ${r['remaining_balance']:,.2f}")
     
-    percent_owned = ((r['quote_price'] - r['remaining_balance']) / r['quote_price']) * 100
-    print(f"{'Percent of Prop Owned':<25} {percent_owned:.2f}%")
+    # Equity percentage = (Future Value - Loan Balance) / Future Value
+    equity = r['future_value'] - r['remaining_balance']
+    percent_equity = (equity / r['future_value'] * 100) if r['future_value'] > 0 else 0
+    print(f"{'Equity % of Home Value':<25} {percent_equity:.2f}%")
     
     print(f"{'Equity':<25} ${r['future_value'] - r['remaining_balance']:,.2f}")
     print(f"{'Cost of Sale (Comm)':<25} ${r['future_value'] - r['sale_net_price']:,.2f} ({(1-r['realtor_commission_factor'])*100:.1f}%)")
@@ -466,6 +650,7 @@ def print_comparison_table(all_results):
         ('Interest Rate', 'effective_interest_rate', '{:.3%}'),
         ('Loan Duration', 'total_months', '{:.0f} months'),
         ('Mortgage Type', 'mortgage_type', '{}'),
+        ('I/O Period (years)', 'interest_only_period_years', '{:.0f}'),
         ('Cashflow Strategy', 'positive_cashflow_strategy', '{}'),
         
         # Monthly Breakdown
@@ -478,7 +663,9 @@ def print_comparison_table(all_results):
         ('  - HOA', 'hoa_monthly', '${:,.2f}'),
         ('  - PMI', 'pmi_monthly', '${:,.2f}'),
         ('  - Prop Mgmt', 'prop_management_fee', '${:,.2f}'),
-        ('Monthly Out of Pocket', 'monthly_out_of_pocket', '${:,.2f}'),
+        ('Out of Pocket (Month 1)', 'monthly_out_of_pocket_first', '${:,.2f}'),
+        ('Out of Pocket (Final Mo)', 'monthly_out_of_pocket_last', '${:,.2f}'),
+        ('Out of Pocket (Average)', 'monthly_out_of_pocket_avg', '${:,.2f}'),
         
         # Investment Cashflow
         ('--- INVESTMENT CASHFLOW ---', None, None),
@@ -495,6 +682,7 @@ def print_comparison_table(all_results):
         ('Future Home Value', 'future_value', '${:,.2f}'),
         ('Loan Balance at Exit', 'remaining_balance', '${:,.2f}'),
         ('Equity', None, None),  # Calculated dynamically
+        ('Equity %', None, None),  # Calculated dynamically
         ('Cost of Sale (Comm)', None, None),  # Calculated dynamically
         ('Net Sale Proceeds', 'sale_net_price', '${:,.2f}'),
         ('Adjusted Cost Basis', 'adjusted_cost_basis', '${:,.2f}'),
@@ -538,7 +726,7 @@ def print_comparison_table(all_results):
         if label == 'Price $/sqft':
             print(f"{label:<35} |", end="")
             for r in all_results:
-                val = r['quote_price'] / r['sqft']
+                val = r['quote_price'] / r['sqft'] if r['sqft'] > 0 else 0
                 print(f" ${val:<19.2f} |", end="")
             print()
         elif label == 'Equity':
@@ -546,6 +734,13 @@ def print_comparison_table(all_results):
             for r in all_results:
                 equity = r['future_value'] - r['remaining_balance']
                 print(f" ${equity:<19,.2f} |", end="")
+            print()
+        elif label == 'Equity %':
+            print(f"{label:<35} |", end="")
+            for r in all_results:
+                equity = r['future_value'] - r['remaining_balance']
+                percent = (equity / r['future_value'] * 100) if r['future_value'] > 0 else 0
+                print(f" {percent:<19.2f}% |", end="")
             print()
         elif label == 'Cost of Sale (Comm)':
             print(f"{label:<35} |", end="")
@@ -571,18 +766,28 @@ def print_comparison_table(all_results):
             for r in all_results:
                 
                 # Handle special cases
-                if key == 'monthly_out_of_pocket':
-                    val = -r[key]  # Flip sign for display
-                elif key == 'profit_difference':
+                if key == 'profit_difference':
                     val = r['total_net_profit'] - r['sp500_net_profit']
                 elif key == 'winner':
                     diff = r['total_net_profit'] - r['sp500_net_profit']
                     val = "Rental" if diff > 0 else "S&P 500"
+                elif key == 'monthly_out_of_pocket_first':
+                    val = r.get('monthly_out_of_pocket_first', r.get('monthly_out_of_pocket', 0))
+                elif key == 'monthly_out_of_pocket_last':
+                    val = r.get('monthly_out_of_pocket_last', r.get('monthly_out_of_pocket', 0))
+                elif key == 'monthly_out_of_pocket_avg':
+                    val = r.get('monthly_out_of_pocket_avg', r.get('monthly_out_of_pocket', 0))
+                elif key == 'positive_cashflow_strategy':
+                    val = r.get('p', {}).get('positive_cashflow_strategy', r.get(key, 'reinvest'))
+                elif key == 'interest_only_period_years':
+                    val = r.get('interest_only_period_years', r.get('p', {}).get('interest_only_period_years', 3))
                 else:
                     val = r.get(key, 'N/A')
                 
                 if isinstance(val, str):
                     print(f" {val:<20} |", end="")
+                elif val == 'N/A':
+                    print(f" {'N/A':<20} |", end="")
                 else:
                     print(f" {fmt.format(val):<20} |", end="")
             print()
@@ -602,21 +807,21 @@ if __name__ == "__main__":
         'deal_name': 'Irent',
         
         # Property Details
-        'sqft': 2300,
-        'quote_price': 500000.00,       # Purchase Price
-        'fair_market_value': 500000.00, # Instant Equity!
-        'rent_per_sqft': 1.31,
+        'sqft': 2114,
+        'quote_price': 630000.00,       # Purchase Price
+        'fair_market_value': 650000.00, # Instant Equity!
+        'rent_per_sqft': 1.51,
         
         # Expenses & Reserves
-        'prop_tax_rate': 0.0151,        # 1.51%
-        'hoa_monthly': 119.00,
+        'prop_tax_rate': 0.0130,        # 1.51%
+        'hoa_monthly': 220.00,
         'home_ins_monthly': 60.00,
         'prop_management_percent': 0.0, # 0% if self-managed
         'safety_deposit_months': 2,     # Reserve fund in months of total costs
         
         # Growth & Taxes
         'holding_years': 3,             # Global default holding period
-        'appreciation_yoy': 0.03,       # 3%
+        'appreciation_yoy': 0.04,       # 3%
         'realtor_commission_factor': 0.94, # 94% net after 6% comm
         'tax_bracket': 0.24,            # Federal Ordinary Income
         'state': 'PA',
@@ -632,55 +837,39 @@ if __name__ == "__main__":
         
         # Self-Contained Loan Scenarios (Financing Details)
         'loan_scenarios': [
-            {
-                'name': 'Rama', 
-                'mortgage_type': 'amortizing', 
-                'down_percent': 0.20,
-                'base_interest_rate': 0.04,
-                'loan_duration_years': 30,
-                'advance_payment': 5000.00,
-                'one_time_other': 20000.00,
-                'closing_credits': 0.00,
-                'points_purchased': 0,
-                'pmi_monthly': 0.00
-            },
+            # {
+            #     'name': 'Rama', 
+            #     'mortgage_type': 'amortizing', 
+            #     'down_percent': 0.20,
+            #     'base_interest_rate': 0.04,
+            #     'loan_duration_years': 30,
+            #     'advance_payment': 5000.00,
+            #     'one_time_other': 20000.00,
+            #     'closing_credits': 0.00,
+            #     'points_purchased': 0,
+            #     'pmi_monthly': 0.00
+            # },
             {
                 'name': 'SBLOC_paydown', 
                 'mortgage_type': 'interest_only', 
                 'down_percent': 0.0, 
-                'base_interest_rate': 0.045,
+                'base_interest_rate': 0.0475,
                 'advance_payment': 5000.00,
                 'one_time_other': 20000.00,
                 'closing_credits': 0.00,
+                'interest_only_period_years': 3,  # Configurable I/O period
                 'positive_cashflow_strategy': 'pay_down_loan'
             },
             {
                 'name': 'SBLOC_paydown_20%', 
                 'mortgage_type': 'interest_only', 
                 'down_percent': 0.20, 
-                'base_interest_rate': 0.045,
+                'base_interest_rate': 0.0475,
                 'advance_payment': 5000.00,
                 'one_time_other': 20000.00,
                 'closing_credits': 0.00,
+                'interest_only_period_years': 3,  # Configurable I/O period
                 'positive_cashflow_strategy': 'pay_down_loan'
-            },
-            {
-                'name': 'SBLOC 5Y', 
-                'mortgage_type': 'interest_only', 
-                'down_percent': 0.0, 
-                'base_interest_rate': 0.045,
-                'advance_payment': 5000.00,
-                'one_time_other': 20000.00,
-                'closing_credits': 0.00
-            },
-            {
-                'name': 'SBLOC 5Y_20%', 
-                'mortgage_type': 'interest_only', 
-                'down_percent': 0.20, 
-                'base_interest_rate': 0.045,
-                'advance_payment': 5000.00,
-                'one_time_other': 20000.00,
-                'closing_credits': 0.00
             },
             {
                 'name': 'Morg', 
@@ -741,7 +930,8 @@ if __name__ == "__main__":
                 'base_interest_rate': 0.045,
                 'advance_payment': 5000.00,
                 'one_time_other': 20000.00,
-                'closing_credits': 0.00
+                'closing_credits': 0.00,
+                'interest_only_period_years': 3  # Configurable I/O period
             },
             {
                 'name': 'SBLOC 5Y_20%', 
@@ -750,7 +940,8 @@ if __name__ == "__main__":
                 'base_interest_rate': 0.045,
                 'advance_payment': 5000.00,
                 'one_time_other': 20000.00,
-                'closing_credits': 0.00
+                'closing_credits': 0.00,
+                'interest_only_period_years': 3  # Configurable I/O period
             },
             {
                 'name': 'Morg_30Y_1', 
