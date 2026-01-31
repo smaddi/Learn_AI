@@ -562,6 +562,120 @@ def calculate_deal(params):
     break_even_years = break_even_month / 12 if break_even_month else None
 
     # ==========================================
+    # 3.6 CASHFLOW SOLVERS
+    # ==========================================
+    
+    # 1. Price for Positive Cashflow (Break-even Month 1)
+    # Target: Cashflow >= 0 <=> Out_of_pocket <= 0
+    # Out_of_pocket = (EMI + OpEx) - EffectiveRent
+    # We want EMI + OpEx <= EffectiveRent
+    
+    # Re-calculate parts that depend on Price to solve for Price
+    # Fixed OpEx (Independent of Price)
+    # Note: Prop Mgmt Fee depends on Effective Rent, which is fixed here (since Rent is fixed)
+    # We must calculate it based on Effective Rent to match the loop logic
+    effective_rent = monthly_rent_gross * (1 - vacancy_rate)
+    prop_management_fee_effective = effective_rent * prop_management_percent
+    
+    opex_fixed = home_ins_monthly + hoa_monthly + pmi_monthly + prop_management_fee_effective + monthly_capex_reserve
+    
+    # Variable OpEx Factor (Per $ of Price)
+    # prop_tax = Price * rate/12, maintenance = Price * rate/12
+    opex_variable_factor = (prop_tax_rate / 12) + (maintenance_percent / 12)
+    
+    # Loan EMI Factor (Per $ of Loan Amount)
+    # Loan Amount = Price * (1 - down_percent)
+    loan_to_price_ratio = (1 - down_percent)
+    
+    # EMI Factor per $ of Loan (depends on Rate, which is constant here)
+    if monthly_rate > 0:
+        if mortgage_type == 'interest_only':
+            emi_factor_loan = monthly_rate
+        else:
+            try:
+                emi_factor_loan = monthly_rate * math.pow(1 + monthly_rate, total_months) / (math.pow(1 + monthly_rate, total_months) - 1)
+            except (OverflowError, ZeroDivisionError):
+                 emi_factor_loan = monthly_rate # Fallback
+    else:
+         if mortgage_type == 'interest_only':
+             emi_factor_loan = 0
+         else:
+             emi_factor_loan = 1 / total_months if total_months > 0 else 0
+             
+    total_price_factor = opex_variable_factor + (loan_to_price_ratio * emi_factor_loan)
+    
+    # Effective Rent (Target Revenue) - Month 1
+    target_revenue = effective_rent
+    
+    # Equation: Price * Total_Factor + Fixed_OpEx = Target_Revenue
+    # Price = (Target_Revenue - Fixed_OpEx) / Total_Factor
+    
+    required_price_for_cashflow = 0.0
+    if total_price_factor > 0:
+        required_price_for_cashflow = (target_revenue - opex_fixed) / total_price_factor
+    else:
+        required_price_for_cashflow = float('inf') 
+        
+    # 2. Interest Rate for Positive Cashflow
+    # Target: EMI + OpEx <= EffectiveRent
+    # EMI <= EffectiveRent - OpEx (at current Price)
+    # OpEx includes variable parts at CURRENT Price
+    # We reconstruct OpEx to ensure Mgmt Fee is based on Effective Rent
+    current_opex_for_solver = prop_tax_monthly + home_ins_monthly + hoa_monthly + pmi_monthly + prop_management_fee_effective + monthly_maintenance + monthly_capex_reserve
+    
+    max_affordable_emi = target_revenue - current_opex_for_solver
+    
+    required_interest_rate_pct = 0.0
+    
+    if max_affordable_emi < 0:
+        # Expenses > Rent even without loan
+        required_interest_rate_pct = -999.0 # Impossible (Need negative rate)
+    elif loan_amount <= 0:
+        # No loan, so rate doesn't matter
+        required_interest_rate_pct = 0.0 
+    else:
+        # We need to find rate such that CalculateEMI(rate) = max_affordable_emi
+        target_payment_ratio = max_affordable_emi / loan_amount
+        
+        if mortgage_type == 'interest_only':
+            # EMI = Loan * Rate
+            # Rate = EMI / Loan
+            req_monthly = target_payment_ratio
+            required_interest_rate_pct = req_monthly * 12
+        else:
+            # Solve Amortization: P * r(1+r)^n / ((1+r)^n - 1) = T
+            # Monotonic increasing with r. Bisection method.
+            
+            def amort_payment_factor(r, n):
+                if r <= 0: return 1/n if n > 0 else 0
+                try:
+                    num = r * math.pow(1+r, n)
+                    den = math.pow(1+r, n) - 1
+                    return num/den
+                except OverflowError:
+                    return float('inf')
+
+            low_g, high_g = 0.0, 2.0 # 0% to 200% monthly
+            # Check feasibility at 0%
+            if amort_payment_factor(0, total_months) > target_payment_ratio:
+                 required_interest_rate_pct = -1.0 # Even 0% is too expensive (principal payment > affordable)
+            else:
+                final_rate = 0.0
+                for _ in range(50):
+                    mid = (low_g + high_g) / 2
+                    val = amort_payment_factor(mid, total_months)
+                    if abs(val - target_payment_ratio) < 1e-9:
+                        final_rate = mid
+                        break
+                    if val < target_payment_ratio:
+                        low_g = mid
+                    else:
+                        high_g = mid
+                
+                final_rate = (low_g + high_g) / 2
+                required_interest_rate_pct = final_rate * 12
+
+    # ==========================================
     # 4. EXIT CALCULATIONS
     # ==========================================
     
@@ -745,6 +859,110 @@ def calculate_deal(params):
 
     net_monthly_pocket = total_net_profit / months_owned if months_owned > 0 else 0
     
+    # Breakdown of Cash Invested
+    total_monthly_contributions = sp500_total_invested - total_starting_investment
+    
+    # ==========================================
+    # 6. BREAK-EVEN PROPERTY APPRECIATION RATES
+    # ==========================================
+    # Calculate minimum YoY appreciation rate for property to break even on:
+    # 1. Total Net Profit = 0
+    # 2. Net Profit Difference = 0 (match S&P 500)
+    
+    def calculate_breakeven_appreciation_rate(target_net_profit):
+        """
+        Binary search to find the minimum appreciation_yoy rate that achieves the target_net_profit.
+        Returns the appreciation rate as a decimal (e.g., 0.033 for 3.3%).
+        Returns None if no valid rate exists in reasonable range.
+        """
+        # Search range: -10% to +20% appreciation
+        low, high = -0.10, 0.20
+        tolerance = 0.0001  # 0.01% precision
+        max_iterations = 100
+        
+        for iteration in range(max_iterations):
+            mid = (low + high) / 2
+            
+            # Create a temp params dict with modified appreciation
+            temp_params = p.copy()
+            temp_params['appreciation_yoy'] = mid
+            
+            # Recalculate just the necessary parts
+            # We need: future_value, capital_gains_tax, ending_value, total_net_profit
+            temp_future_value = fair_market_value * math.pow(1 + mid, holding_years)
+            temp_sale_net_price = temp_future_value * realtor_commission_factor
+            
+            # Tax calculation (simplified - reuse most existing values)
+            temp_taxable_gain = max(0, temp_sale_net_price - adjusted_cost_basis)
+            
+            # Calculate capital gains tax based on exit strategy
+            if exit_strategy == '1031_exchange':
+                temp_capital_gains_tax = 0
+            elif exit_strategy == 'primary_residence':
+                exclusion_amount = 0
+                if primary_residence_years >= 2:
+                    exclusion_amount = 500000 if filing_status == 'married' else 250000
+                
+                excluded_gain = min(exclusion_amount, temp_taxable_gain)
+                remaining_gain = max(0, temp_taxable_gain - excluded_gain)
+                
+                if remaining_gain > 0:
+                    if holding_years <= 1.0:
+                        temp_capital_gains_tax = remaining_gain * combined_ordinary_rate
+                    else:
+                        recapture_portion = min(total_depreciation, remaining_gain)
+                        recapture_tax_total_rate = recapture_tax_rate + state_income_rate
+                        tax_on_recapture = recapture_portion * recapture_tax_total_rate
+                        
+                        pure_capital_gain = max(0, remaining_gain - recapture_portion)
+                        long_term_total_rate = long_term_cap_gains_rate + state_cap_gains_rate
+                        tax_on_remaining = pure_capital_gain * long_term_total_rate
+                        
+                        temp_capital_gains_tax = tax_on_recapture + tax_on_remaining
+                else:
+                    temp_capital_gains_tax = 0
+            else:
+                if temp_taxable_gain > 0:
+                    if holding_years <= 1.0:
+                        temp_capital_gains_tax = temp_taxable_gain * combined_ordinary_rate
+                    else:
+                        recapture_portion = min(total_depreciation, temp_taxable_gain)
+                        recapture_tax_total_rate = recapture_tax_rate + state_income_rate
+                        tax_on_recapture = recapture_portion * recapture_tax_total_rate
+                        
+                        pure_capital_gain = max(0, temp_taxable_gain - recapture_portion)
+                        long_term_total_rate = long_term_cap_gains_rate + state_cap_gains_rate
+                        tax_on_capital_gain = pure_capital_gain * long_term_total_rate
+                        
+                        temp_capital_gains_tax = tax_on_recapture + tax_on_capital_gain
+                else:
+                    temp_capital_gains_tax = 0
+            
+            temp_cash_from_sale = (temp_sale_net_price - remaining_balance) - temp_capital_gains_tax + safety_reserve
+            temp_ending_value = temp_cash_from_sale + house_reinvestment_balance - rental_tax_impact
+            temp_total_net_profit = temp_ending_value - total_invested_denominator
+            
+            # Check if we've found the target
+            if abs(temp_total_net_profit - target_net_profit) < tolerance:
+                return mid
+            
+            # Adjust search range
+            if temp_total_net_profit < target_net_profit:
+                low = mid  # Need higher appreciation
+            else:
+                high = mid  # Need lower appreciation
+            
+            # Check for convergence
+            if high - low < tolerance:
+                return mid
+        
+        # If we didn't converge, return the best estimate
+        return mid
+    
+    # Calculate break-even rates
+    breakeven_appreciation_for_zero_profit = calculate_breakeven_appreciation_rate(0)
+    breakeven_appreciation_for_sp500_match = calculate_breakeven_appreciation_rate(sp500_net_profit)
+    
     # Return everything in local scope
     return locals()
 
@@ -868,6 +1086,9 @@ def print_detailed_report(results):
         print(f"{'Tax Due (Rental Income)':<25} ${r['rental_tax_impact']:,.2f}")
         
     print(f"{'Reinvested Cash Flow':<25} ${r['house_reinvestment_balance']:,.2f}")
+    print(f"{'Total Cash Invested':<25} ${r['sp500_total_invested']:,.2f}")
+    print(f"{'  - Initial Investment':<25} ${r['total_starting_investment']:,.2f}")
+    print(f"{'  - Recurring Contribs':<25} ${r['total_monthly_contributions']:,.2f}")
     print(f"{'Total Net Profit':<25} ${r['total_net_profit']:,.2f}")
     print(f"{'Total ROI':<25} {r['roi']:.2f}%")
     print(f"{'Annualized Return (CAGR)':<25} {r['annualized_return']:.2f}%")
@@ -981,6 +1202,9 @@ def print_comparison_table(all_results):
         ('--- RETURNS ANALYSIS ---', None, None, None),
         ('Rental Tax Impact', 'rental_tax_impact', '${:,.2f}', 'Tax owed (+) or saved (-) from rental'),
         ('Reinvested Cash Flow', 'house_reinvestment_balance', '${:,.2f}', 'Positive cashflow invested in S&P'),
+        ('Total Cash Invested', 'sp500_total_invested', '${:,.2f}', 'Total cash contributed (Initial + Out-of-pocket)'),
+        ('  - Initial Investment', 'total_starting_investment', '${:,.2f}', 'Upfront cash required'),
+        ('  - Recurring Contribs', 'total_monthly_contributions', '${:,.2f}', 'Sum of monthly out-of-pocket costs'),
         ('Total Net Profit', 'total_net_profit', '${:,.2f}', 'Final profit after all costs & taxes'),
         ('Total ROI', 'roi', '{:.2f}%', 'Total profit / Total invested'),
         ('Annualized Return (CAGR)', 'annualized_return', '{:.2f}%', 'Compound annual growth rate'),
@@ -993,6 +1217,13 @@ def print_comparison_table(all_results):
         ('S&P Net Profit (After Tax)', 'sp500_net_profit', '${:,.2f}', 'S&P profit after taxes'),
         ('S&P ROI', 'sp500_roi', '{:.2f}%', 'S&P profit / Total invested'),
         ('S&P CAGR', 'sp500_cagr', '{:.2f}%', 'S&P compound annual growth rate'),
+        
+        # Positive Cashflow Requirements
+        ('--- POSITIVE FLOW REQ ---', None, None, None),
+        ('Price for Pos Cashflow', 'required_price_for_cashflow', '${:,.0f}', 'Max purchase price to break even on M1 cashflow'),
+        ('Interest Rate for Pos CF', 'required_interest_rate_pct', '{:.3%}', 'Max interest rate to break even on M1 cashflow'),
+        ('Min Apprec Rate (Profit=0)', 'breakeven_appreciation_for_zero_profit', '{:.2%}', 'Min YoY appreciation for Total Net Profit = 0'),
+        ('Min Apprec Rate (Match S&P)', 'breakeven_appreciation_for_sp500_match', '{:.2%}', 'Min YoY appreciation to match S&P 500 profit'),
         
         # Final Comparison
         ('--- FINAL COMPARISON ---', None, None, None),
@@ -1066,6 +1297,16 @@ def print_comparison_table(all_results):
                 elif key == 'winner':
                     diff = r['total_net_profit'] - r['sp500_net_profit']
                     val = "Rental" if diff > 0 else "S&P 500"
+                elif key == 'required_price_for_cashflow':
+                     val = r.get('required_price_for_cashflow', 0)
+                     if val < 0:
+                         val = "Impossible (Neg)"
+                     elif val == float('inf'):
+                         val = "Any Price"
+                elif key == 'required_interest_rate_pct':
+                     val = r.get('required_interest_rate_pct', 0)
+                     if val < 0:
+                         val = "Impossible"
                 elif key == 'monthly_out_of_pocket_first':
                     val = r.get('monthly_out_of_pocket_first', r.get('monthly_out_of_pocket', 0))
                 elif key == 'monthly_out_of_pocket_last':
@@ -1075,7 +1316,12 @@ def print_comparison_table(all_results):
                 elif key == 'positive_cashflow_strategy':
                     val = r.get('p', {}).get('positive_cashflow_strategy', r.get(key, 'reinvest'))
                 elif key == 'interest_only_period_years':
-                    val = r.get('interest_only_period_years', r.get('p', {}).get('interest_only_period_years', 3))
+                    # Only show I/O period for interest_only mortgages
+                    mortgage_type = r.get('mortgage_type', 'amortizing')
+                    if mortgage_type == 'interest_only':
+                        val = r.get('interest_only_period_years', r.get('p', {}).get('interest_only_period_years', 3))
+                    else:
+                        val = 'N/A'  # Amortizing loans don't have an I/O period
                 elif key == 'break_even_month':
                     val = r.get('break_even_month')
                     if val is None:
@@ -1113,23 +1359,25 @@ if __name__ == "__main__":
         
         # Property Details
         'sqft': 2114,
-        'quote_price': 558000.00,       # Purchase Price
-        'fair_market_value': 650000.00, # Instant Equity!
-        'rent_per_sqft': 1.63,
+        'quote_price': 570000.00,       # Purchase Price
+        'fair_market_value': 588000.00, # Instant Equity!
+        'rent_per_sqft': 1.65,
         
         # Expenses & Reserves
         'prop_tax_rate': 0.0130,        # 1.51%
         'hoa_monthly': 220.00,
-        'home_ins_monthly': 60.00,
+        'home_ins_monthly': 80.00,
         'prop_management_percent': 0.0, # 0% if self-managed
-        'safety_deposit_months': 2,     # Reserve fund in months of total costs
+        'safety_deposit_months': 0,     # Reserve fund in months of total costs
         'capex_percent': 0.00,
         'maintenance_percent': 0.002,
-        'vacancy_rate': 0.083,
-        
+        'vacancy_rate': 0.125,
+        # 'rent_appreciation_yoy': 0.0,
+        'one_time_other': 20000.00,
+
         # Growth & Taxes
-        'holding_years': 3,             # Global default holding period
-        'appreciation_yoy': 0.033,       # 3%
+        'holding_years': 5,             # Global default holding period
+        'appreciation_yoy': 0.033,      # 3%
         'realtor_commission_factor': 0.94, # 94% net after 6% comm
         'tax_bracket': 0.24,            # Federal Ordinary Income
         'state': 'PA',
@@ -1161,11 +1409,11 @@ if __name__ == "__main__":
                 'name': 'SBLOC_paydown', 
                 'mortgage_type': 'interest_only', 
                 'down_percent': 0.0, 
-                'base_interest_rate': 0.0475,
+                'base_interest_rate': 0.049,
                 'advance_payment': 5000.00,
-                'one_time_other': 20000.00,
+                # 'one_time_other': 20000.00,   
                 'closing_credits': 0.00,
-                'interest_only_period_years': 3,  # Configurable I/O period
+                'interest_only_period_years': 5,  # Configurable I/O period
                 'positive_cashflow_strategy': 'pay_down_loan'
             },
             # {
@@ -1179,18 +1427,42 @@ if __name__ == "__main__":
             #     'interest_only_period_years': 3,  # Configurable I/O period
             #     'positive_cashflow_strategy': 'pay_down_loan'
             # },
-            # {
-            #     'name': 'Morg', 
-            #     'mortgage_type': 'amortizing', 
-            #     'down_percent': 0.0,
-            #     'base_interest_rate': 0.058,
-            #     'loan_duration_years': 30,
-            #     'advance_payment': 5000.00,
-            #     'one_time_other': 20000.00,
-            #     'closing_credits': 0.00,
-            #     'points_purchased': 0,
-            #     'pmi_monthly': 0.00
-            # },
+            {
+                'name': 'Morg', 
+                'mortgage_type': 'amortizing', 
+                'down_percent': 0.0,
+                'base_interest_rate': 0.058,
+                'loan_duration_years': 30,
+                'advance_payment': 5000.00,
+                # 'one_time_other': 20000.00,
+                'closing_credits': 0.00,
+                'points_purchased': 0,
+                'pmi_monthly': 0.00
+            },
+            {
+                'name': 'Morg_20', 
+                'mortgage_type': 'amortizing', 
+                'down_percent': 0.20,
+                'base_interest_rate': 0.058,
+                'loan_duration_years': 30,
+                'advance_payment': 5000.00,
+                # 'one_time_other': 20000.00,
+                'closing_credits': 0.00,
+                'points_purchased': 0,
+                'pmi_monthly': 0.00
+            },
+            {
+                'name': 'Morg_25', 
+                'mortgage_type': 'amortizing', 
+                'down_percent': 0.25,
+                'base_interest_rate': 0.058,
+                'loan_duration_years': 30,
+                'advance_payment': 5000.00,
+                # 'one_time_other': 20000.00,
+                'closing_credits': 0.00,
+                'points_purchased': 0,
+                'pmi_monthly': 0.00
+            },
             # {
             #     'name': 'SBLOC_1031', 
             #     'mortgage_type': 'interest_only', 
@@ -1215,7 +1487,7 @@ if __name__ == "__main__":
         
         # Property Details
         'sqft': 2035,
-        'quote_price': 375000.00,
+        'quote_price': 374000.00,
         'fair_market_value': 390000.00,
         'rent_per_sqft': 1.0,
         
@@ -1226,10 +1498,11 @@ if __name__ == "__main__":
         'prop_management_percent': 0.07,
         'safety_deposit_months': 2,
         'capex_percent': 0.00,
-        'maintenance_percent': 0.00,
+        'maintenance_percent': 0.002,
+        'one_time_other': 20000.00,
         
         # Growth & Taxes
-        'holding_years': 3,
+        'holding_years': 5,
         'appreciation_yoy': 0.033,
         'realtor_commission_factor': 0.94,
         'tax_bracket': 0.24,
@@ -1249,11 +1522,47 @@ if __name__ == "__main__":
                 'name': 'SBLOC 5Y', 
                 'mortgage_type': 'interest_only', 
                 'down_percent': 0.0, 
-                'base_interest_rate': 0.0475,
+                'base_interest_rate': 0.049,
                 'advance_payment': 5000.00,
-                'one_time_other': 20000.00,
+                # 'one_time_other': 20000.00,       
                 'closing_credits': 0.00,
                 'interest_only_period_years': 3  # Configurable I/O period
+            },
+            {
+                'name': 'Morg', 
+                'mortgage_type': 'amortizing', 
+                'down_percent': 0.0,
+                'base_interest_rate': 0.058,
+                'loan_duration_years': 30,
+                'advance_payment': 5000.00,
+                # 'one_time_other': 20000.00,       
+                'closing_credits': 0.00,
+                'points_purchased': 0,
+                'pmi_monthly': 0.00
+            },
+            {
+                'name': 'Morg_20', 
+                'mortgage_type': 'amortizing', 
+                'down_percent': 0.20,
+                'base_interest_rate': 0.058,
+                'loan_duration_years': 30,
+                'advance_payment': 5000.00,
+                # 'one_time_other': 20000.00,       
+                'closing_credits': 0.00,
+                'points_purchased': 0,
+                'pmi_monthly': 0.00
+            },
+            {
+                'name': 'Morg_25', 
+                'mortgage_type': 'amortizing', 
+                'down_percent': 0.25,
+                'base_interest_rate': 0.058,
+                'loan_duration_years': 30,
+                'advance_payment': 5000.00,
+                # 'one_time_other': 20000.00,       
+                'closing_credits': 0.00,
+                'points_purchased': 0,
+                'pmi_monthly': 0.00
             },
             # {
             #     'name': 'SBLOC 5Y_20%', 
@@ -1311,7 +1620,7 @@ if __name__ == "__main__":
         return variants
 
     # List of all properties to process
-    properties = [deal1, deal2]
+    properties = [deal1,deal2]
     
     # Generate all mortgage options for each property
     my_deals = []
