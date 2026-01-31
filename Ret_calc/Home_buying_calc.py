@@ -1113,7 +1113,7 @@ if __name__ == "__main__":
         
         # Property Details
         'sqft': 2114,
-        'quote_price': 610000.00,       # Purchase Price
+        'quote_price': 558000.00,       # Purchase Price
         'fair_market_value': 650000.00, # Instant Equity!
         'rent_per_sqft': 1.63,
         
@@ -1124,7 +1124,8 @@ if __name__ == "__main__":
         'prop_management_percent': 0.0, # 0% if self-managed
         'safety_deposit_months': 2,     # Reserve fund in months of total costs
         'capex_percent': 0.00,
-        'maintenance_percent': 0.00,
+        'maintenance_percent': 0.002,
+        'vacancy_rate': 0.083,
         
         # Growth & Taxes
         'holding_years': 3,             # Global default holding period
